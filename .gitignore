@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 model_pricing_cache
+benchmark_cache.json
 .DS_Store
 *.swp
 *.py~
+.ENV
