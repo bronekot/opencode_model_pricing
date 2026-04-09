@@ -100,11 +100,11 @@ def fetch_benchmarks(api_key):
 
 
 def needs_api_fetch(model_names, cache):
-    """Возвращает список моделей/причин, требующих обновления кеша.
+    """Возвращает список моделей, требующих обновления кеша.
 
     Обновление нужно если:
     - в таблице цен есть модель, которой нет в кеше совсем
-    - в кеше (среди любых записей) есть просроченные null-записи
+    - в таблице цен есть модель с просроченной null-записью в кеше
     """
     today = datetime.now().strftime('%Y-%m-%d')
     missing = []
@@ -119,18 +119,47 @@ def needs_api_fetch(model_names, cache):
             if entry.get('_null_date') != today:
                 missing.append(name)
 
-    # Также проверяем AA-модели в кеше на просроченные null-записи
-    stale_nulls = sum(
-        1 for v in cache.values()
-        if v.get('gpqa') is None and v.get('coding') is None
-        and v.get('_null_date') != today
-    )
-    if stale_nulls and not missing:
-        # Нет новых моделей в таблице, но есть просроченные null в кеше AA-моделей
-        # Используем sentinel-флаг (не имя модели, не попадёт в кеш)
-        return ['__refresh__']
-
     return missing
+
+
+def enrich_with_bridgebench(cache):
+    """Обогащает кеш данными BridgeBench (статические данные)."""
+    for bb_name, score in BRIDGEBENCH_DATA.items():
+        norm_bb = normalize_name(bb_name)
+        search_patterns = BRIDGEBENCH_TO_AA_MAP.get(norm_bb, [bb_name])
+
+        # Ищем соответствующую модель в кеше
+        cache_key = None
+        for pattern in search_patterns:
+            pattern_lower = pattern.lower()
+            for key in cache:
+                if pattern_lower in key.lower():
+                    cache_key = key
+                    break
+            if cache_key:
+                break
+
+        if cache_key:
+            cache[cache_key]['bridgebench'] = score
+        else:
+            # Если не нашли в кеше, создаём запись с помощью маппинга из opencode
+            # Пробуем найти через model_map из match_model_to_benchmarks
+            for key in cache:
+                norm_key = normalize_name(key)
+                # Проверяем по ключевым словам
+                bb_words = set(norm_bb.split())
+                key_words = set(norm_key.split())
+                if bb_words & key_words:  # Есть общие слова
+                    # Проверяем, что это действительно нужная модель
+                    if ('opus' in norm_bb and 'opus' in norm_key) or \
+                       ('minimax' in norm_bb and 'minimax' in norm_key) or \
+                       ('gpt' in norm_bb and 'gpt' in norm_key and 'codex' in norm_key) or \
+                       ('kimi' in norm_bb and 'kimi' in norm_key) or \
+                       ('glm' in norm_bb and 'glm' in norm_key):
+                        cache[key]['bridgebench'] = score
+                        break
+
+    return cache
 
 
 def get_benchmarks_for_models(model_names, api_key):
@@ -173,10 +202,7 @@ def get_benchmarks_for_models(model_names, api_key):
         new_total += 1
 
     # Для моделей из таблицы цен, которые не нашлись в API напрямую — пробуем маппинг
-    # Пропускаем sentinel-флаг
     for name in missing:
-        if name == '__refresh__':
-            continue
         if name in cache and (cache[name].get('gpqa') is not None or cache[name].get('coding') is not None):
             continue
         bench = match_model_to_benchmarks(name, api_benchmarks)
@@ -186,6 +212,9 @@ def get_benchmarks_for_models(model_names, api_key):
             cache[name] = {'gpqa': None, 'coding': None, '_null_date': today}
 
     print(f"Кеш обновлён: {len(cache)} записей ({new_total} из API)")
+
+    # Обогащаем данными BridgeBench
+    cache = enrich_with_bridgebench(cache)
     save_benchmark_cache(cache)
     return cache
 
@@ -195,77 +224,74 @@ def normalize_name(name):
     name = name.lower().strip()
     name = re.sub(r'\(.*?\)', '', name)
     name = re.sub(r'[<>]=?\s*\d+k', '', name)
+    name = re.sub(r'\bfree\b', '', name)
     name = re.sub(r'\s+', ' ', name).strip()
     name = name.replace('-', ' ').replace('_', ' ')
     return name
+
+
+def get_effort_rank(name):
+    """Извлекает приоритет effort-варианта из названия модели."""
+    match = re.search(r'\(([^()]*)\)\s*$', name)
+    if not match:
+        return 0
+
+    suffix = match.group(1).lower()
+
+    if 'xhigh' in suffix or 'max effort' in suffix or 'adaptive reasoning' in suffix:
+        return 3
+    if 'high' in suffix:
+        return 2
+    if 'medium' in suffix:
+        return 1
+    if 'low' in suffix:
+        return 0
+    if 'minimal' in suffix:
+        return -1
+    return 0
+
+
+def benchmark_similarity(model_name, benchmark_name):
+    """Оценивает похожесть имени модели и имени из бенчмарка."""
+    model_norm = normalize_name(model_name)
+    benchmark_norm = normalize_name(benchmark_name)
+
+    model_words = set(model_norm.split())
+    benchmark_words = set(benchmark_norm.split())
+    if not model_words or not benchmark_words:
+        return 0.0
+
+    intersection = len(model_words & benchmark_words)
+    union = len(model_words | benchmark_words)
+    return intersection / union if union else 0.0
+
+
+def has_useful_benchmark(benchmark):
+    return bool(benchmark) and (benchmark.get('gpqa') is not None or benchmark.get('coding') is not None)
 
 
 def match_model_to_benchmarks(model_name, benchmarks):
     """Сопоставление модели из таблицы цен с данными бенчмарков."""
     if not benchmarks:
         return None
-    
-    norm_name = normalize_name(model_name)
-    
-    # Маппинг названий моделей из opencode.ai на Artificial Analysis
-    model_map = {
-        'big pickle': None,
-        'minimax m2.5 free': 'MiniMax-M2.5',
-        'minimax m2.5': 'MiniMax-M2.5',
-        'minimax m2.1': 'MiniMax-M2.1',
-        'glm 5 free': 'GLM-5 (Reasoning)',
-        'glm 5': 'GLM-5 (Reasoning)',
-        'glm 4.7': 'GLM-4.7 (Reasoning)',
-        'glm 4.6': 'GLM-4.6 (Reasoning)',
-        'kimi k2.5 free': 'Kimi K2.5 (Reasoning)',
-        'kimi k2.5': 'Kimi K2.5 (Reasoning)',
-        'kimi k2 thinking': 'Kimi K2 Thinking',
-        'kimi k2': 'Kimi K2 0905',
-        'qwen3 coder 480b': 'Qwen3 Coder 480B A35B Instruct',
-        'claude opus 4.6': 'Claude Opus 4.6 (Adaptive Reasoning, Max Effort)',
-        'claude opus 4.5': 'Claude Opus 4.5 (Reasoning)',
-        'claude opus 4.1': 'Claude 4.1 Opus (Reasoning)',
-        'claude sonnet 4.6': 'Claude Sonnet 4.6 (Adaptive Reasoning, Max Effort)',
-        'claude sonnet 4.5': 'Claude 4.5 Sonnet (Reasoning)',
-        'claude sonnet 4': 'Claude 4 Sonnet (Reasoning)',
-        'claude haiku 4.5': 'Claude 4.5 Haiku (Reasoning)',
-        'claude haiku 3.5': 'Claude 3.5 Haiku',
-        'gemini 3.1 pro': 'Gemini 3.1 Pro Preview',
-        'gemini 3 pro': 'Gemini 3 Pro Preview (high)',
-        'gemini 3 flash': 'Gemini 3 Flash Preview (Reasoning)',
-        'gpt 5.2': 'GPT-5.2 (medium)',
-        'gpt 5.2 codex': 'GPT-5.2 Codex (xhigh)',
-        'gpt 5.1': 'GPT-5.1 (high)',
-        'gpt 5.1 codex': 'GPT-5.1 Codex (high)',
-        'gpt 5.1 codex max': 'GPT-5.1 Codex (high)',
-        'gpt 5.1 codex mini': 'GPT-5.1 Codex mini (high)',
-        'gpt 5': 'GPT-5 (high)',
-        'gpt 5 codex': 'GPT-5 Codex (high)',
-        'gpt 5 nano': 'GPT-5 nano (high)',
-    }
-    
-    mapped_name = model_map.get(norm_name)
-    if mapped_name is None and norm_name in model_map:
-        return None  # Явно указано, что нет соответствия
-    
-    if mapped_name and mapped_name in benchmarks:
-        return benchmarks[mapped_name]
-    
-    # Фоллбэк: поиск по частичному совпадению
+
     best_match = None
-    best_score = 0
-    for api_name in benchmarks:
-        norm_api = normalize_name(api_name)
-        # Считаем общие слова
-        words_model = set(norm_name.split())
-        words_api = set(norm_api.split())
-        common = len(words_model & words_api)
-        total = max(len(words_model), 1)
-        score = common / total
-        if score > best_score and score >= 0.6:
+    best_score = (-1, -1, -1, -1)
+    for index, api_name in enumerate(benchmarks):
+        benchmark = benchmarks[api_name]
+        similarity = benchmark_similarity(model_name, api_name)
+        effort_rank = get_effort_rank(api_name)
+        useful_rank = 1 if has_useful_benchmark(benchmark) else 0
+        score = (
+            useful_rank,
+            similarity,
+            effort_rank,
+            -index,
+        )
+        if score > best_score:
             best_score = score
             best_match = api_name
-    
+
     if best_match:
         return benchmarks[best_match]
     return None
@@ -353,24 +379,57 @@ def load_models_from_cache():
         return None, None
 
 
-# Якоря для CodIndex: Haiku 3.5 → 0, Opus 4.6 → 100
+# Якоря для CodIndex: Haiku 3.5 → 10, Opus 4.6 → 100
 # Значения Coding (AA Coding Index) для якорных моделей
 COD_INDEX_MIN = 10.7   # Claude Haiku 3.5
 COD_INDEX_MAX = 48.1   # Claude Opus 4.6
+COD_INDEX_MIN_VAL = 10  # Целевое значение для Haiku 3.5
+COD_INDEX_MAX_VAL = 100  # Целевое значение для Opus 4.6
+
+# BridgeBench бенчмарк (источник: bridgemind.ai/bridgebench)
+# Overall score на реальных задачах программирования
+BRIDGEBENCH_DATA = {
+    'Claude Sonnet 4.6': 94.9,
+    'Claude Opus 4.6': 94.8,
+    'GPT-5.3 Codex': 94.6,
+    'Qwen3.5 Plus 02-15': 93.6,
+    'GPT-5.2 Codex': 92.8,
+    'MiniMax M2.5': 92.3,
+    'Qwen3.5 397B A17B': 92.1,
+    'GLM-5': 89.5,
+    'Kimi K2.5': 89.1,
+    'Gemini 3.1 Pro Preview': 75.6,
+    'Aurora Alpha': 57.6,
+}
+
+# Маппинг имён BridgeBench на имена в AA API для поиска в кеше
+BRIDGEBENCH_TO_AA_MAP = {
+    'claude sonnet 4.6': ['Claude Sonnet 4.6', 'Sonnet 4.6'],
+    'claude opus 4.6': ['Claude Opus 4.6', 'Opus 4.6'],
+    'gpt 5.3 codex': ['GPT-5.3 Codex', 'GPT 5.3 Codex'],
+    'qwen3.5 plus 02-15': ['Qwen3.5 Plus', 'Qwen 3.5 Plus'],
+    'gpt 5.2 codex': ['GPT-5.2 Codex', 'GPT 5.2 Codex'],
+    'minimax m2.5': ['MiniMax-M2.5', 'MiniMax M2.5'],
+    'qwen3.5 397b a17b': ['Qwen3.5 397B', 'Qwen 3.5 397B'],
+    'glm 5': ['GLM-5', 'GLM 5'],
+    'kimi k2.5': ['Kimi K2.5'],
+    'gemini 3.1 pro preview': ['Gemini 3.1 Pro', 'Gemini 3.1 Pro Preview'],
+    'aurora alpha': ['Aurora Alpha'],
+}
 
 
 def compute_cod_index(coding):
     """Вычисляет CodIndex — линейный индекс качества кодинга.
 
-    Формула: CodIndex = 100 * t, где t = (x - min) / (max - min)
-    Якоря: Claude Haiku 3.5 (Coding=10.7) → 0, Claude Opus 4.6 (Coding=48.1) → 100.
-    Модели ниже якоря → 0, выше → >100.
+    Формула: CodIndex = 10 + 90 * (x - min) / (max - min)
+    Якоря: Claude Haiku 3.5 (Coding=10.7) → 10, Claude Opus 4.6 (Coding=48.1) → 100.
+    Модели ниже якоря → 10, выше → >100.
     """
     if coding is None:
         return None
     t = (coding - COD_INDEX_MIN) / (COD_INDEX_MAX - COD_INDEX_MIN)
     t = max(t, 0.0)
-    return round(100 * t, 1)
+    return round(COD_INDEX_MIN_VAL + (COD_INDEX_MAX_VAL - COD_INDEX_MIN_VAL) * t, 1)
 
 
 def format_benchmark(value):
@@ -434,9 +493,41 @@ def main():
         output_val = parse_price(output_price)
         
         weighted_price = 0.9784 * input_val + 0.0216 * output_val if input_val != float('inf') and output_val != float('inf') else float('inf')
-        
+
         bench = benchmarks.get(name) if benchmarks else None
-        
+
+        # Ищем BridgeBench через маппинг (по нормализованным именам)
+        bridgebench = None
+        if benchmarks:
+            norm_name = normalize_name(name)
+            for bb_name, score in BRIDGEBENCH_DATA.items():
+                norm_bb = normalize_name(bb_name)
+                # Точное совпадение
+                if norm_name == norm_bb:
+                    bridgebench = score
+                    break
+
+                # Проверяем по словам
+                bb_words = set(norm_bb.split())
+                name_words = set(norm_name.split())
+
+                # Если в BB есть "codex", то и в имени должно быть "codex"
+                bb_has_codex = 'codex' in bb_words
+                name_has_codex = 'codex' in name_words
+                if bb_has_codex != name_has_codex:
+                    continue
+
+                # Исключаем "codex" из проверки (уже проверили выше)
+                exclude_words = {'codex', 'pro', 'preview', 'plus'}
+                bb_key_words = bb_words - exclude_words
+                if bb_key_words and bb_key_words.issubset(name_words):
+                    # Проверяем версии
+                    bb_nums = set(w for w in bb_words if any(c.isdigit() for c in w))
+                    name_nums = set(w for w in name_words if any(c.isdigit() for c in w))
+                    if bb_nums == name_nums or not bb_nums:
+                        bridgebench = score
+                        break
+
         coding = bench.get('coding') if bench else None
         models.append({
             'name': name,
@@ -446,19 +537,29 @@ def main():
             'gpqa': bench.get('gpqa') if bench else None,
             'coding': coding,
             'cod_index': compute_cod_index(coding),
+            'bridgebench': bridgebench,
         })
     
-    models_sorted = sorted(models, key=lambda x: x['weighted_price'])
+    models_sorted = sorted(
+        models,
+        key=lambda x: (
+            x['weighted_price'],
+            float('inf') if x['cod_index'] is None else -x['cod_index'],
+        ),
+    )
     
     has_benchmarks = benchmarks is not None
-    
+    has_bridgebench = any(m.get('bridgebench') is not None for m in models)
+
     if has_benchmarks:
-        header = f"{'Model':<40} {'Input':<10} {'Output':<10} {'Weighted':<10} {'CodIdx':<8} {'Coding':<8} {'GPQA':<8}"
-        separator = "-" * 94
+        bb_col = 7 if has_bridgebench else 0
+        bb_header = f" {'Bridge':<{bb_col}}" if has_bridgebench else ""
+        header = f"{'Model':<40} {'Input':<10} {'Output':<10} {'Weighted':<10} {'CodIdx':<8} {'Coding':<8} {'GPQA':<8}" + bb_header
+        separator = "-" * (94 + bb_col)
     else:
         header = f"{'Model':<40} {'Input':<12} {'Output':<12} {'Weighted':<12}"
         separator = "-" * 76
-    
+
     print()
     print(header)
     print(separator)
@@ -467,18 +568,24 @@ def main():
             weighted_str = f"${model['weighted_price']:.4f}"
         else:
             weighted_str = "-"
-        
+
         if has_benchmarks:
             cod_idx_str = format_cod_index(model['cod_index'])
             coding_str = format_benchmark(model['coding'])
             gpqa_str = format_benchmark(model['gpqa'])
-            print(f"{model['name']:<40} {model['input_price']:<10} {model['output_price']:<10} {weighted_str:<10} {cod_idx_str:<8} {coding_str:<8} {gpqa_str:<8}")
+            bb_str = format_benchmark(model['bridgebench']) if has_bridgebench else ""
+            if has_bridgebench:
+                print(f"{model['name']:<40} {model['input_price']:<10} {model['output_price']:<10} {weighted_str:<10} {cod_idx_str:<8} {coding_str:<8} {gpqa_str:<8} {bb_str:<{bb_col}}")
+            else:
+                print(f"{model['name']:<40} {model['input_price']:<10} {model['output_price']:<10} {weighted_str:<10} {cod_idx_str:<8} {coding_str:<8} {gpqa_str:<8}")
         else:
             print(f"{model['name']:<40} {model['input_price']:<12} {model['output_price']:<12} {weighted_str:<12}")
 
     if has_benchmarks:
         print()
-        print(f"CodIdx: линейный индекс кодинга (0=Haiku 3.5, 100=Opus 4.6). Coding = AA Coding Index, GPQA = GPQA Diamond")
+        print(f"CodIdx: линейный индекс кодинга (10=Haiku 3.5, 100=Opus 4.6). Coding = AA Coding Index, GPQA = GPQA Diamond")
+        if has_bridgebench:
+            print(f"Bridge = BridgeBench Overall (источник: bridgemind.ai)")
         print("Источник бенчмарков: artificialanalysis.ai")
 
 
