@@ -1,31 +1,60 @@
-# OpenCode Model Pricing
+# OpenCode Zen Nuxt
 
-Скрипт для парсинга цен на AI-модели с сайта OpenCode и их сортировки по стоимости.
+Nuxt приложение для сравнения цен и бенчмарков AI моделей с OpenCode Zen.
 
-## Требования
+## Установка
 
-Python 3.x
+```bash
+npm install
+```
+
+## Настройка
+
+Скопируйте `.ENV.example` в `.ENV` и добавьте ваш API ключ:
+
+```bash
+cp .ENV.example .ENV
+```
+
+Отредактируйте `.ENV`:
+```
+ARTIFICIAL_ANALYSIS_API=your_api_key_here
+```
 
 ## Запуск
 
 ```bash
+npm run dev
+```
+
+Приложение будет доступно по адресу http://localhost:3000
+
+## Сборка для продакшена
+
+```bash
+npm run build
+npm run preview
+```
+
+### Генерация статического сайта
+
+```bash
+npm run generate
+```
+
+## Функционал
+
+- Автоматическая загрузка цен с https://opencode.ai/docs/zen
+- Получение бенчмарков из Artificial Analysis API
+- Расчёт взвешенной цены (97.84% вход + 2.16% выход)
+- CodIndex — линейный индекс качества кодинга
+- BridgeBench бенчмарки для актуальных моделей
+- Адаптивный дизайн
+
+## Python скрипт (оригинал)
+
+Оригинальный Python скрипт доступен в `opencode_pricing.py` для локального использования:
+
+```bash
 python opencode_pricing.py
-```
-
-## Что делает
-
-- Загружает информацию о ценах с https://opencode.ai/docs/zen
-- Кэширует данные для оффлайн-работы
-- Сортирует модели по взвешенной цене (98% input + 2% output)
-- Выводит отсортированный список моделей
-
-## Пример вывода
-
-```
-Model                                   Input        Output       Weighted    
-----------------------------------------------------------------------------
-Big Pickle                              Free         Free         $0.0000
-MiniMax M2.1                            $0.30        $1.20        $0.3592
-GPT 5.1 Codex Mini                     $0.25        $2.00        $0.2694
-...
 ```
