@@ -4,6 +4,9 @@
       <h1>OpenCode Zen Pricing</h1>
       <p class="subtitle">Сравнение цен и бенчмарков AI моделей</p>
       <p v-if="lastUpdate" class="update-time">Обновлено: {{ lastUpdate }}</p>
+      <p class="subtitle">USD за 1 млн токенов · 97.84% вход + 2.16% выход</p>
+      <p v-if="data?.stale_prices" class="update-time">Источник цен недоступен, показаны сохранённые цены.</p>
+      <p v-if="data?.benchmarks_stale" class="update-time">Бенчмарки из устаревшего кэша.</p>
     </header>
 
     <div v-if="!models || models.length === 0" class="error">
@@ -13,7 +16,7 @@
     <main v-else class="main">
       <div class="stats">
         <div class="stat-card">
-          <span class="stat-label">Всего моделей</span>
+          <span class="stat-label">Строк тарифов</span>
           <span class="stat-value">{{ models.length }}</span>
         </div>
         <div class="stat-card" v-if="hasBenchmarks">
@@ -37,14 +40,14 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="model in sortedModels" :key="model.name" :class="{ 'row-infinite': model.weighted_price === Infinity }">
+            <tr v-for="model in sortedModels" :key="model.name" :class="{ 'row-infinite': model.weighted_price === null }">
               <td class="col-name">
                 <span class="model-name">{{ model.name }}</span>
               </td>
               <td class="col-price">{{ model.input_price }}</td>
               <td class="col-price">{{ model.output_price }}</td>
               <td class="col-price">
-                <span v-if="model.weighted_price !== Infinity" class="price-weighted">
+                <span v-if="model.weighted_price !== null" class="price-weighted">
                   {{ formatWeightedPrice(model.weighted_price) }}
                 </span>
                 <span v-else class="price-na">-</span>
@@ -53,42 +56,36 @@
                 {{ formatValue(model.cod_index) }}
               </td>
               <td v-if="hasBenchmarks" class="col-benchmark">
-                {{ formatBenchmark(model.coding) }}
+                {{ formatValue(model.coding) }}
               </td>
               <td v-if="hasBenchmarks" class="col-benchmark">
-                {{ formatBenchmark(model.gpqa) }}
+                {{ formatGpqa(model.gpqa) }}
               </td>
               <td v-if="hasBridgebench" class="col-benchmark">
-                {{ formatBenchmark(model.bridgebench) }}
+                {{ formatValue(model.bridgebench) }}
               </td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <div v-if="hasBenchmarks" class="legend">
-        <p><strong>CodIdx:</strong> линейный индекс кодинга (10=Haiku 3.5, 100=Opus 4.6)</p>
-        <p><strong>Coding:</strong> AA Coding Index, <strong>GPQA:</strong> GPQA Diamond</p>
-        <p v-if="hasBridgebench"><strong>Bridge:</strong> BridgeBench Overall (bridgemind.ai)</p>
-        <p class="source">Источник бенчмарков: artificialanalysis.ai</p>
+      <div class="legend">
+        <p>Взвешенная цена не учитывает скидки на кэширование. Контекстные тарифы показаны отдельными строками.</p>
+        <template v-if="hasBenchmarks">
+          <p><strong>CodIdx:</strong> историческая шкала Coding: 10.7 → 10, 48.1 → 100; может превышать 100.</p>
+          <p><strong>Coding:</strong> AA Coding Index, <strong>GPQA:</strong> GPQA Diamond.</p>
+          <p>Для одной модели выбирается доступный вариант с наибольшим reasoning effort. «-» означает отсутствие подтверждённого соответствия.</p>
+          <p class="source">Бенчмарки: <a href="https://artificialanalysis.ai/">Artificial Analysis</a>, {{ formatDate(data?.benchmarks_updated_at) }}.</p>
+        </template>
+        <p v-if="hasBridgebench"><strong>Bridge:</strong> Overall rating, снимок от {{ data?.bridgebench_updated_at }} — <a :href="data?.bridgebench_source">BridgeBench</a>. Обновляется вручную.</p>
+        <p class="source">Цены: <a href="https://opencode.ai/docs/zen/#pricing">OpenCode Zen</a>.</p>
       </div>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-interface Model {
-  name: string
-  input_price: string
-  output_price: string
-  weighted_price: number
-  gpqa: number | null
-  coding: number | null
-  cod_index: number | null
-  bridgebench: number | null
-}
-
-// Загружаем данные при сборке (статическая генерация)
+// SSR загружает данные с сервера; generate сохраняет снимок в payload страницы.
 const { data } = await useFetch('/api/models', {
   key: 'models-data',
   deep: false
@@ -96,7 +93,7 @@ const { data } = await useFetch('/api/models', {
 
 const models = computed(() => data.value?.models || [])
 const hasBenchmarks = computed(() => data.value?.has_benchmarks || false)
-const lastUpdate = computed(() => data.value?.last_update || '')
+const lastUpdate = computed(() => formatDate(data.value?.last_update))
 
 const modelsWithBenchmarks = computed(() =>
   models.value.filter(m => m.coding !== null || m.gpqa !== null).length
@@ -107,7 +104,9 @@ const hasBridgebench = computed(() =>
 )
 
 const sortedModels = computed(() =>
-  [...models.value].sort((a, b) => a.weighted_price - b.weighted_price)
+  [...models.value].sort((a, b) =>
+    (a.weighted_price ?? Infinity) - (b.weighted_price ?? Infinity)
+    || (b.cod_index ?? -Infinity) - (a.cod_index ?? -Infinity))
 )
 
 function formatWeightedPrice(price: number): string {
@@ -119,10 +118,14 @@ function formatValue(value: number | null): string {
   return value.toFixed(1)
 }
 
-function formatBenchmark(value: number | null): string {
+function formatGpqa(value: number | null): string {
   if (value === null) return '-'
-  if (value < 1) return `${(value * 100).toFixed(1)}%`
-  return value.toFixed(1)
+  return `${(value * 100).toFixed(1)}%`
+}
+
+function formatDate(value: string | null | undefined): string {
+  if (!value) return ''
+  return new Date(value).toLocaleString('ru-RU', { timeZone: 'UTC' }) + ' UTC'
 }
 
 useHead({

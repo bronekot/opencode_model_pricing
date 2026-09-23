@@ -1,0 +1,40 @@
+{
+  "benchmarks": {
+    "GPT-6 Sol (medium)": { "gpqa": 0.5, "coding": 10 },
+    "GPT-6 Sol (xhigh)": { "gpqa": 0.7, "coding": 30 },
+    "GPT-6 Sol (max)": { "gpqa": 0.8, "coding": 40 },
+    "GPT-6 Astra (max)": { "gpqa": 0.9, "coding": 50 },
+    "GPT-5.1 Codex (high)": { "gpqa": 0.5, "coding": 15 },
+    "GPT-5.1 Codex mini (high)": { "gpqa": 0.4, "coding": 10 },
+    "Claude 4.5 Sonnet (Reasoning)": { "gpqa": 0.6, "coding": 20 },
+    "Claude Opus 5 (Adaptive Reasoning, High Effort)": { "gpqa": 0.6, "coding": 20 },
+    "Claude Opus 5 (Adaptive Reasoning, Max Effort)": { "gpqa": 0.7, "coding": 25 },
+    "MiniMax-M2.5": { "gpqa": 0, "coding": 0 },
+    "Gemini 3.1 Pro Preview": { "gpqa": 0.6, "coding": 20 },
+    "Gemini 3 Flash Preview (Reasoning)": { "gpqa": 0.6, "coding": 20 },
+    "Qwen3.8 Max (0902)": { "gpqa": 0.6, "coding": 20 },
+    "DeepSeek V4 Pro 0813 (Reasoning, Max Effort)": { "gpqa": 0.6, "coding": 20 },
+    "Unavailable Model": { "gpqa": null, "coding": null }
+  },
+  "cases": [
+    ["GPT 6 Sol (≤ 272K tokens)", "GPT-6 Sol (max)"],
+    ["GPT 6 Sol (> 272K tokens)", "GPT-6 Sol (max)"],
+    ["GPT 6 Astra", "GPT-6 Astra (max)"],
+    ["GPT 6 Luna", null],
+    ["GPT 5.1 Codex Max", null],
+    ["GPT 5.1 Codex Mini", "GPT-5.1 Codex mini (high)"],
+    ["GPT 5.1", null],
+    ["Claude Sonnet 4.5", "Claude 4.5 Sonnet (Reasoning)"],
+    ["Claude Sonnet 5", null],
+    ["Claude Opus 5", "Claude Opus 5 (Adaptive Reasoning, Max Effort)"],
+    ["MiniMax M2.5 Free", "MiniMax-M2.5"],
+    ["MiniMax M2.7", null],
+    ["Gemini 3.1 Pro", "Gemini 3.1 Pro Preview"],
+    ["Gemini 3 Flash", "Gemini 3 Flash Preview (Reasoning)"],
+    ["Qwen3.8 Max", null],
+    ["DeepSeek V4 Pro", null],
+    ["Unavailable Model", "Unavailable Model"],
+    ["Big Pickle", null],
+    ["Unknown Model", null]
+  ]
+}

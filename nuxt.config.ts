@@ -5,10 +5,7 @@ import { dirname, join } from 'node:path'
 // Load .ENV file
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
-dotenv.config({ path: join(__dirname, '.ENV') })
-
-// Получаем API ключ из переменных окружения (поддерживаем оба варианта написания)
-const apiKey = process.env.ARTIFICIAL_ANALYSIS_API || process.env.ARTIFICIAL_ANALYSIS_API || ''
+dotenv.config({ path: [join(__dirname, '.ENV'), join(__dirname, '.env')], quiet: true })
 
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
@@ -18,14 +15,14 @@ export default defineNuxtConfig({
     port: 3000
   },
   nitro: {
-    experimental: {
-      openAPI: true
+    storage: {
+      cache: { driver: 'fs', base: './.data/cache' }
     }
   },
   ssr: true,
   css: ['~/assets/css/main.css'],
   runtimeConfig: {
     // Server-side runtime config (доступен только на сервере)
-    artificialAnalysisApi: apiKey
+    artificialAnalysisApi: ''
   }
 })

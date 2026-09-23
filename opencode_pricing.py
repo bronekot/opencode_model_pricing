@@ -1,593 +1,395 @@
-import urllib.request
-from urllib.error import URLError, HTTPError
-import re
+"""Цены OpenCode Zen и бенчмарки Artificial Analysis, без внешних зависимостей."""
+
+import argparse
+from datetime import datetime, timezone
+from html import unescape
+from html.parser import HTMLParser
 import json
-from datetime import datetime
+import math
 import os
+from pathlib import Path
+import re
+import urllib.request
+from urllib.error import URLError
+
+BASE_DIR = Path(__file__).resolve().parent
+PRICING_URL = 'https://opencode.ai/docs/zen/'
+BENCHMARK_URL = 'https://artificialanalysis.ai/api/v2/data/llms/models'
+BENCHMARK_TTL = 24 * 60 * 60
+INPUT_WEIGHT = 0.9784
+OUTPUT_WEIGHT = 0.0216
+COD_INDEX_MIN = 10.7
+COD_INDEX_MAX = 48.1
+
+with (BASE_DIR / 'data/bridgebench.json').open(encoding='utf-8') as f:
+    BRIDGEBENCH = json.load(f)
+with (BASE_DIR / 'data/model_aliases.json').open(encoding='utf-8') as f:
+    MODEL_ALIASES = json.load(f)
 
 
 def parse_price(price_str):
-    if price_str == 'Free':
+    price_str = unescape(price_str).strip()
+    if price_str.lower() == 'free':
         return 0.0
-    elif price_str.startswith('$'):
-        return float(price_str.replace('$', '').replace(',', ''))
-    elif price_str == '-' or price_str.strip() == '':
-        return float('inf')
-    else:
-        return float('inf')
+    if re.fullmatch(r'\$\s*\d[\d,]*(?:\.\d+)?', price_str):
+        return float(price_str[1:].replace(',', '').strip())
+    return float('inf')
 
 
 def load_env():
-    """Загрузка переменных из .ENV файла."""
-    env_file = os.path.join(os.path.dirname(__file__), '.ENV')
+    """Переменные процесса имеют приоритет над .ENV и .env."""
     env_vars = {}
-    try:
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    env_vars[key.strip()] = value.strip()
-    except FileNotFoundError:
-        pass
+    for filename in ('.env', '.ENV'):
+        try:
+            lines = (BASE_DIR / filename).read_text(encoding='utf-8').splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if line.startswith('export '):
+                line = line[7:]
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in '\"\'':
+                value = value[1:-1]
+            else:
+                value = re.split(r'\s+#', value, maxsplit=1)[0].rstrip()
+            env_vars[key.strip()] = value
+    env_vars.update(os.environ)
     return env_vars
 
 
-# Модели, для которых не нужно запрашивать бенчмарки
-SKIP_BENCHMARK_MODELS = {'big pickle'}
+def get_api_key():
+    env = load_env()
+    return next((env[key] for key in (
+        'NUXT_ARTIFICIAL_ANALYSIS_API', 'ARTIFICIAL_ANALYSIS_API',
+        'ARTIFICICAL_ANALYSIS_API',
+    ) if env.get(key)), None)
 
 
 def get_benchmark_cache_path():
-    return os.path.join(os.path.dirname(__file__), 'benchmark_cache.json')
+    return BASE_DIR / 'benchmark_cache.json'
+
+
+def valid_benchmarks(models):
+    return isinstance(models, dict) and bool(models) and all(
+        isinstance(name, str) and isinstance(entry, dict) and all(
+            entry.get(field) is None or (
+                type(entry[field]) in (int, float) and math.isfinite(entry[field])
+            ) for field in ('gpqa', 'coding')
+        ) for name, entry in models.items()
+    )
 
 
 def load_benchmark_cache():
-    """Загрузка кеша бенчмарков из файла."""
-    cache_path = get_benchmark_cache_path()
     try:
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        with open(get_benchmark_cache_path(), encoding='utf-8') as f:
+            cache = json.load(f)
+        # Старый формат содержит недостоверные результаты нечёткого сопоставления.
+        if (isinstance(cache, dict) and cache.get('version') == 2
+                and isinstance(cache.get('fetched_at'), (int, float))
+                and valid_benchmarks(cache.get('models'))):
+            return cache
+    except (OSError, ValueError):
+        pass
+    return {}
 
 
 def save_benchmark_cache(cache):
-    """Сохранение кеша бенчмарков в файл."""
-    cache_path = get_benchmark_cache_path()
-    with open(cache_path, 'w', encoding='utf-8') as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-
-
-def is_null_entry_expired(entry):
-    """Проверяет, истёк ли срок хранения записи с пустыми данными (текущий день)."""
-    null_date = entry.get('_null_date')
-    if not null_date:
-        return True
-    today = datetime.now().strftime('%Y-%m-%d')
-    return null_date != today
+    path = Path(get_benchmark_cache_path())
+    try:
+        temp = path.with_suffix('.tmp')
+        temp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding='utf-8')
+        temp.replace(path)
+    except OSError as error:
+        print(f'Не удалось сохранить кэш бенчмарков: {error}')
 
 
 def fetch_benchmarks(api_key):
-    """Получение всех бенчмарков через Artificial Analysis API."""
-    url = 'https://artificialanalysis.ai/api/v2/data/llms/models'
     try:
-        req = urllib.request.Request(url, headers={
-            'x-api-key': api_key,
-            'User-Agent': 'Mozilla/5.0'
+        request = urllib.request.Request(BENCHMARK_URL, headers={
+            'x-api-key': api_key, 'User-Agent': 'OpenCode-Model-Pricing',
         })
-        with urllib.request.urlopen(req, timeout=15) as response:
-            data = json.loads(response.read().decode('utf-8'))
-
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        if not isinstance(payload, dict) or not isinstance(payload.get('data'), list):
+            raise ValueError('неожиданный формат ответа API')
         benchmarks = {}
-        for model in data.get('data', []):
-            evals = model.get('evaluations', {})
-            name = model.get('name', '')
-            creator = model.get('model_creator', {}).get('name', '')
-
-            gpqa = evals.get('gpqa')
-            coding = evals.get('artificial_analysis_coding_index')
-
-            benchmarks[name] = {
-                'creator': creator,
-                'gpqa': gpqa,
-                'coding': coding,
+        for model in payload['data']:
+            if not isinstance(model, dict) or not isinstance(model.get('name'), str):
+                continue
+            evaluations = model.get('evaluations') or {}
+            creator = model.get('model_creator') or {}
+            benchmarks[model['name']] = {
+                'creator': creator.get('name'),
+                'gpqa': evaluations.get('gpqa'),
+                'coding': evaluations.get('artificial_analysis_coding_index'),
             }
-
+        if not valid_benchmarks(benchmarks):
+            raise ValueError('API не вернул корректные бенчмарки')
         return benchmarks
-    except (URLError, HTTPError, json.JSONDecodeError) as e:
-        print(f"Не удалось получить бенчмарки: {e}")
+    except (URLError, OSError, ValueError, AttributeError) as error:
+        print(f'Не удалось получить бенчмарки: {error}')
         return None
 
 
-def needs_api_fetch(model_names, cache):
-    """Возвращает список моделей, требующих обновления кеша.
-
-    Обновление нужно если:
-    - в таблице цен есть модель, которой нет в кеше совсем
-    - в таблице цен есть модель с просроченной null-записью в кеше
-    """
-    today = datetime.now().strftime('%Y-%m-%d')
-    missing = []
-
-    for name in model_names:
-        if normalize_name(name) in SKIP_BENCHMARK_MODELS:
-            continue
-        entry = cache.get(name)
-        if entry is None:
-            missing.append(name)
-        elif entry.get('gpqa') is None and entry.get('coding') is None:
-            if entry.get('_null_date') != today:
-                missing.append(name)
-
-    return missing
-
-
-def enrich_with_bridgebench(cache):
-    """Обогащает кеш данными BridgeBench (статические данные)."""
-    for bb_name, score in BRIDGEBENCH_DATA.items():
-        norm_bb = normalize_name(bb_name)
-        search_patterns = BRIDGEBENCH_TO_AA_MAP.get(norm_bb, [bb_name])
-
-        # Ищем соответствующую модель в кеше
-        cache_key = None
-        for pattern in search_patterns:
-            pattern_lower = pattern.lower()
-            for key in cache:
-                if pattern_lower in key.lower():
-                    cache_key = key
-                    break
-            if cache_key:
-                break
-
-        if cache_key:
-            cache[cache_key]['bridgebench'] = score
-        else:
-            # Если не нашли в кеше, создаём запись с помощью маппинга из opencode
-            # Пробуем найти через model_map из match_model_to_benchmarks
-            for key in cache:
-                norm_key = normalize_name(key)
-                # Проверяем по ключевым словам
-                bb_words = set(norm_bb.split())
-                key_words = set(norm_key.split())
-                if bb_words & key_words:  # Есть общие слова
-                    # Проверяем, что это действительно нужная модель
-                    if ('opus' in norm_bb and 'opus' in norm_key) or \
-                       ('minimax' in norm_bb and 'minimax' in norm_key) or \
-                       ('gpt' in norm_bb and 'gpt' in norm_key and 'codex' in norm_key) or \
-                       ('kimi' in norm_bb and 'kimi' in norm_key) or \
-                       ('glm' in norm_bb and 'glm' in norm_key):
-                        cache[key]['bridgebench'] = score
-                        break
-
-    return cache
-
-
-def get_benchmarks_for_models(model_names, api_key):
-    """Получение бенчмарков с учётом кеша. Вызывает API только если нужно."""
+def get_benchmarks_for_models(model_names, api_key, *, offline=False, refresh=False):
+    """Кэшируем исходный ответ API на сутки; сопоставляем имена заново при запуске."""
     cache = load_benchmark_cache()
-    today = datetime.now().strftime('%Y-%m-%d')
-
-    missing = needs_api_fetch(model_names, cache)
-
-    if not missing:
-        print(f"Все бенчмарки загружены из кеша ({len(cache)} записей)")
-        return cache
-
-    if not api_key:
-        print("API ключ Artificial Analysis не найден в .ENV, бенчмарки не загружены")
-        return cache if cache else None
-
-    print(f"Нет актуального кеша для {len(missing)} моделей, запрос к Artificial Analysis API...")
-    api_benchmarks = fetch_benchmarks(api_key)
-    if not api_benchmarks:
-        print(f"API недоступен, используется кеш ({len(cache)} записей)")
-        return cache if cache else None
-
-    print(f"Получены данные API для {len(api_benchmarks)} моделей")
-
-    # Сохраняем ВСЕ модели из API в кеш (кроме тех у которых уже есть данные)
-    new_total = 0
-    for name, bench in api_benchmarks.items():
-        existing = cache.get(name)
-        # Не перезаписываем уже имеющиеся данные (с gpqa или coding)
-        if existing and (existing.get('gpqa') is not None or existing.get('coding') is not None):
-            continue
-        cache[name] = {
-            'creator': bench.get('creator'),
-            'gpqa': bench.get('gpqa'),
-            'coding': bench.get('coding'),
-        }
-        if bench.get('gpqa') is None and bench.get('coding') is None:
-            cache[name]['_null_date'] = today
-        new_total += 1
-
-    # Для моделей из таблицы цен, которые не нашлись в API напрямую — пробуем маппинг
-    for name in missing:
-        if name in cache and (cache[name].get('gpqa') is not None or cache[name].get('coding') is not None):
-            continue
-        bench = match_model_to_benchmarks(name, api_benchmarks)
-        if bench and (bench.get('gpqa') is not None or bench.get('coding') is not None):
-            cache[name] = {'creator': bench.get('creator'), 'gpqa': bench.get('gpqa'), 'coding': bench.get('coding')}
-        else:
-            cache[name] = {'gpqa': None, 'coding': None, '_null_date': today}
-
-    print(f"Кеш обновлён: {len(cache)} записей ({new_total} из API)")
-
-    # Обогащаем данными BridgeBench
-    cache = enrich_with_bridgebench(cache)
-    save_benchmark_cache(cache)
-    return cache
+    now = datetime.now(timezone.utc).timestamp()
+    age = now - cache.get('fetched_at', 0)
+    fresh = bool(cache) and 0 <= age < BENCHMARK_TTL
+    if not offline and api_key and (refresh or not fresh):
+        benchmarks = fetch_benchmarks(api_key)
+        if benchmarks:
+            cache = {'version': 2, 'fetched_at': now, 'models': benchmarks}
+            save_benchmark_cache(cache)
+            fresh = True
+            print(f'Бенчмарки обновлены: {len(benchmarks)} записей API')
+    elif not offline and not api_key and not fresh:
+        print('Ключ Artificial Analysis не настроен; используются доступные данные кэша')
+    if not cache:
+        return None
+    timestamp = datetime.fromtimestamp(cache['fetched_at'], timezone.utc).isoformat(timespec='seconds')
+    print(f'Бенчмарки от {timestamp}' + ('' if fresh else ' (устаревший кэш)'))
+    source = cache['models']
+    return {name: match_model_to_benchmarks(name, source) for name in model_names}
 
 
 def normalize_name(name):
-    """Нормализация имени модели для сопоставления."""
-    name = name.lower().strip()
-    name = re.sub(r'\(.*?\)', '', name)
-    name = re.sub(r'[<>]=?\s*\d+k', '', name)
-    name = re.sub(r'\bfree\b', '', name)
+    """Сохраняем версии и варианты; убираем только контекст, Free и режим reasoning."""
+    name = unescape(name).lower().strip()
+
+    def strip_metadata(match):
+        value = match.group(1)
+        if re.search(r'\b(?:effort|reasoning|tokens)\b|^(?:max|xhigh|high|medium|low|minimal)$', value):
+            return ' '
+        if re.fullmatch(r'[<>≤≥]=?\s*\d+k(?:\s+tokens)?', value):
+            return ' '
+        return match.group(0)
+
+    name = re.sub(r'\(([^()]*)\)', strip_metadata, name)
+    name = re.sub(r'\bfree\s*$', '', name)
+    name = re.sub(r'[-_]', ' ', name)
     name = re.sub(r'\s+', ' ', name).strip()
-    name = name.replace('-', ' ').replace('_', ' ')
     return name
 
 
+def model_identity(name, *, aliases=True):
+    normalized = normalize_name(name)
+    if aliases:
+        normalized = MODEL_ALIASES.get(normalized, normalized)
+    # Claude 4.5 Sonnet и Claude Sonnet 4.5 — одна модель.
+    return tuple(sorted(normalized.split()))
+
+
 def get_effort_rank(name):
-    """Извлекает приоритет effort-варианта из названия модели."""
-    match = re.search(r'\(([^()]*)\)\s*$', name)
-    if not match:
-        return 0
-
-    suffix = match.group(1).lower()
-
-    if 'xhigh' in suffix or 'max effort' in suffix or 'adaptive reasoning' in suffix:
-        return 3
-    if 'high' in suffix:
-        return 2
-    if 'medium' in suffix:
-        return 1
-    if 'low' in suffix:
-        return 0
-    if 'minimal' in suffix:
+    suffix = ' '.join(re.findall(r'\(([^()]*)\)', name.lower()))
+    for rank, effort in ((5, 'max'), (4, 'xhigh'), (3, 'high'), (2, 'medium'), (1, 'low'), (0, 'minimal')):
+        if re.search(r'\b' + effort + r'\b', suffix):
+            return rank
+    if 'non-reasoning' in suffix:
         return -1
-    return 0
-
-
-def benchmark_similarity(model_name, benchmark_name):
-    """Оценивает похожесть имени модели и имени из бенчмарка."""
-    model_norm = normalize_name(model_name)
-    benchmark_norm = normalize_name(benchmark_name)
-
-    model_words = set(model_norm.split())
-    benchmark_words = set(benchmark_norm.split())
-    if not model_words or not benchmark_words:
-        return 0.0
-
-    intersection = len(model_words & benchmark_words)
-    union = len(model_words | benchmark_words)
-    return intersection / union if union else 0.0
+    return 2 if 'reasoning' in suffix else 0
 
 
 def has_useful_benchmark(benchmark):
-    return bool(benchmark) and (benchmark.get('gpqa') is not None or benchmark.get('coding') is not None)
+    return bool(benchmark) and any(benchmark.get(field) is not None for field in ('gpqa', 'coding'))
 
 
 def match_model_to_benchmarks(model_name, benchmarks):
-    """Сопоставление модели из таблицы цен с данными бенчмарков."""
-    if not benchmarks:
+    if not benchmarks or normalize_name(model_name) == 'big pickle':
         return None
+    identity = model_identity(model_name)
+    candidates = [(name, bench) for name, bench in benchmarks.items()
+                  if model_identity(name) == identity]
+    if not candidates:
+        return None
+    name, benchmark = max(candidates, key=lambda item: (
+        has_useful_benchmark(item[1]), get_effort_rank(item[0]),
+    ))
+    return {**benchmark, 'source_model': name}
 
-    best_match = None
-    best_score = (-1, -1, -1, -1)
-    for index, api_name in enumerate(benchmarks):
-        benchmark = benchmarks[api_name]
-        similarity = benchmark_similarity(model_name, api_name)
-        effort_rank = get_effort_rank(api_name)
-        useful_rank = 1 if has_useful_benchmark(benchmark) else 0
-        score = (
-            useful_rank,
-            similarity,
-            effort_rank,
-            -index,
-        )
-        if score > best_score:
-            best_score = score
-            best_match = api_name
 
-    if best_match:
-        return benchmarks[best_match]
-    return None
+def find_bridgebench(name):
+    identity = model_identity(name, aliases=False)
+    return next((score for model, score in BRIDGEBENCH['scores'].items()
+                 if model_identity(model, aliases=False) == identity), None)
+
+
+class TableParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = []
+        self.table = None
+        self.row = None
+        self.cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self.table = []
+        elif tag == 'tr' and self.table is not None:
+            self.row = []
+        elif tag in ('td', 'th') and self.row is not None:
+            self.cell = []
+        elif tag == 'br' and self.cell is not None:
+            self.cell.append(' ')
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th') and self.cell is not None:
+            self.row.append(' '.join(''.join(self.cell).split()))
+            self.cell = None
+        elif tag == 'tr' and self.row is not None:
+            self.table.append(self.row)
+            self.row = None
+        elif tag == 'table' and self.table is not None:
+            self.tables.append(self.table)
+            self.table = None
 
 
 def fetch_html_from_website():
-    url = 'https://opencode.ai/docs/zen'
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as response:
+        request = urllib.request.Request(PRICING_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(request, timeout=10) as response:
             return response.read().decode('utf-8')
-    except (URLError, HTTPError) as e:
-        print(f"Сайт недоступен: {e}")
+    except (URLError, OSError, UnicodeError) as error:
+        print(f'Сайт недоступен: {error}')
         return None
 
 
 def parse_html_to_models(html_content):
-    models = []
-    
-    table_pattern = re.compile(r'<table>(.*?)</table>', re.DOTALL)
-    tables = table_pattern.findall(html_content)
-    
-    if len(tables) < 2:
-        print("Не удалось найти таблицу с ценами на сайте")
-        return None
-    
-    table_html = tables[1]
-    
-    row_pattern = re.compile(r'<tr>(.*?)</tr>', re.DOTALL)
-    rows = row_pattern.findall(table_html)
-    
-    for row in rows:
-        if '<th>' in row or '<thead' in row:
-            continue
-        
-        cell_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL)
-        cells = cell_pattern.findall(row)
-        
-        if len(cells) < 3:
-            continue
-        
-        clean_cells = []
-        for cell in cells:
-            clean = re.sub(r'<[^>]+>', '', cell)
-            clean = clean.strip()
-            clean_cells.append(clean)
-        
-        if clean_cells:
-            models.append(clean_cells)
-    
-    return models
+    parser = TableParser()
+    parser.feed(html_content)
+    for table in parser.tables:
+        for index, row in enumerate(table):
+            headers = [cell.lower() for cell in row]
+            if not {'model', 'input', 'output'}.issubset(headers):
+                continue
+            columns = [headers.index(field) if field in headers else None
+                       for field in ('model', 'input', 'output', 'cached read', 'cached write')]
+            models = []
+            for cells in table[index + 1:]:
+                if any(column is not None and column >= len(cells) for column in columns[:3]):
+                    continue
+                model = [cells[column] if column is not None and column < len(cells) else '-'
+                         for column in columns]
+                if model[0] and any(math.isfinite(parse_price(price)) for price in model[1:3]):
+                    models.append(model)
+            if models:
+                return models
+    return None
 
 
 def save_models_to_cache(models):
-    cache_file = os.path.join(os.path.dirname(__file__), 'model_pricing_cache')
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    with open(cache_file, 'w', encoding='utf-8') as f:
-        f.write(f"# Cache timestamp: {timestamp}\n")
-        f.write("Model\tInput\tOutput\tCached Read\tCached Write\n")
-        for model in models:
-            f.write('\t'.join(model) + '\n')
+    timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    path = BASE_DIR / 'model_pricing_cache'
+    try:
+        temp = path.with_suffix('.tmp')
+        temp.write_text(f'# Cache timestamp: {timestamp}\n'
+                        + 'Model\tInput\tOutput\tCached Read\tCached Write\n'
+                        + ''.join('\t'.join(model) + '\n' for model in models), encoding='utf-8')
+        temp.replace(path)
+    except OSError as error:
+        print(f'Не удалось сохранить кэш цен: {error}')
 
 
 def load_models_from_cache():
-    cache_file = os.path.join(os.path.dirname(__file__), 'model_pricing_cache')
     try:
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        timestamp = None
-        models = []
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith('# Cache timestamp:'):
-                timestamp = line.replace('# Cache timestamp:', '').strip()
-            elif line and not line.startswith('#') and not line.startswith('Model'):
-                parts = line.split('\t')
-                if len(parts) >= 3:
-                    models.append(parts)
-        
-        return models, timestamp
-    except FileNotFoundError:
+        lines = (BASE_DIR / 'model_pricing_cache').read_text(encoding='utf-8').splitlines()
+    except (OSError, UnicodeError):
         return None, None
-
-
-# Якоря для CodIndex: Haiku 3.5 → 10, Opus 4.6 → 100
-# Значения Coding (AA Coding Index) для якорных моделей
-COD_INDEX_MIN = 10.7   # Claude Haiku 3.5
-COD_INDEX_MAX = 48.1   # Claude Opus 4.6
-COD_INDEX_MIN_VAL = 10  # Целевое значение для Haiku 3.5
-COD_INDEX_MAX_VAL = 100  # Целевое значение для Opus 4.6
-
-# BridgeBench бенчмарк (источник: bridgemind.ai/bridgebench)
-# Overall score на реальных задачах программирования
-BRIDGEBENCH_DATA = {
-    'Claude Sonnet 4.6': 94.9,
-    'Claude Opus 4.6': 94.8,
-    'GPT-5.3 Codex': 94.6,
-    'Qwen3.5 Plus 02-15': 93.6,
-    'GPT-5.2 Codex': 92.8,
-    'MiniMax M2.5': 92.3,
-    'Qwen3.5 397B A17B': 92.1,
-    'GLM-5': 89.5,
-    'Kimi K2.5': 89.1,
-    'Gemini 3.1 Pro Preview': 75.6,
-    'Aurora Alpha': 57.6,
-}
-
-# Маппинг имён BridgeBench на имена в AA API для поиска в кеше
-BRIDGEBENCH_TO_AA_MAP = {
-    'claude sonnet 4.6': ['Claude Sonnet 4.6', 'Sonnet 4.6'],
-    'claude opus 4.6': ['Claude Opus 4.6', 'Opus 4.6'],
-    'gpt 5.3 codex': ['GPT-5.3 Codex', 'GPT 5.3 Codex'],
-    'qwen3.5 plus 02-15': ['Qwen3.5 Plus', 'Qwen 3.5 Plus'],
-    'gpt 5.2 codex': ['GPT-5.2 Codex', 'GPT 5.2 Codex'],
-    'minimax m2.5': ['MiniMax-M2.5', 'MiniMax M2.5'],
-    'qwen3.5 397b a17b': ['Qwen3.5 397B', 'Qwen 3.5 397B'],
-    'glm 5': ['GLM-5', 'GLM 5'],
-    'kimi k2.5': ['Kimi K2.5'],
-    'gemini 3.1 pro preview': ['Gemini 3.1 Pro', 'Gemini 3.1 Pro Preview'],
-    'aurora alpha': ['Aurora Alpha'],
-}
+    timestamp = None
+    models = []
+    for line in lines:
+        if line.startswith('# Cache timestamp:'):
+            timestamp = line.partition(':')[2].strip()
+        elif line and not line.startswith('#') and not line.startswith('Model\t'):
+            parts = line.split('\t')
+            if len(parts) >= 3 and any(math.isfinite(parse_price(price)) for price in parts[1:3]):
+                models.append(parts)
+    return models or None, timestamp
 
 
 def compute_cod_index(coding):
-    """Вычисляет CodIndex — линейный индекс качества кодинга.
-
-    Формула: CodIndex = 10 + 90 * (x - min) / (max - min)
-    Якоря: Claude Haiku 3.5 (Coding=10.7) → 10, Claude Opus 4.6 (Coding=48.1) → 100.
-    Модели ниже якоря → 10, выше → >100.
-    """
+    """Историческая шкала: Coding 10.7 → 10, Coding 48.1 → 100; верхнего предела нет."""
     if coding is None:
         return None
-    t = (coding - COD_INDEX_MIN) / (COD_INDEX_MAX - COD_INDEX_MIN)
-    t = max(t, 0.0)
-    return round(COD_INDEX_MIN_VAL + (COD_INDEX_MAX_VAL - COD_INDEX_MIN_VAL) * t, 1)
+    return round(10 + 90 * max((coding - COD_INDEX_MIN) / (COD_INDEX_MAX - COD_INDEX_MIN), 0), 1)
 
 
-def format_benchmark(value):
-    """Форматирование значения бенчмарка для отображения."""
+def format_benchmark(value, *, percentage=False):
     if value is None:
         return '-'
-    if isinstance(value, float):
-        if value < 1:
-            return f"{value * 100:.1f}%"
-        return f"{value:.1f}"
-    return str(value)
+    return f'{value * 100:.1f}%' if percentage else f'{value:.1f}'
 
 
-def format_cod_index(value):
-    """Форматирование CodIndex."""
-    if value is None:
-        return '-'
-    return f"{value:.1f}"
-
-
-def main():
-    html_content = fetch_html_from_website()
-    
-    if html_content:
-        models_data = parse_html_to_models(html_content)
-        if models_data:
-            save_models_to_cache(models_data)
-            print("Загружено с сайта")
-            source_data = models_data
-        else:
-            print("Не удалось распарсить данные с сайта")
-            models_data, timestamp = load_models_from_cache()
-            if models_data:
-                print(f"Сайт недоступен, используется кэш от {timestamp}")
-                source_data = models_data
-            else:
-                print("Кэш не найден. Пожалуйста, проверьте соединение с интернетом.")
-                return
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--offline', action='store_true', help='использовать только локальный кэш')
+    parser.add_argument('--refresh-benchmarks', action='store_true', help='обновить бенчмарки до истечения суток')
+    parser.add_argument('--no-benchmarks', action='store_true', help='не загружать бенчмарки Artificial Analysis')
+    args = parser.parse_args(argv)
+    if args.offline and args.refresh_benchmarks:
+        parser.error('--offline несовместим с --refresh-benchmarks')
+    html = None if args.offline else fetch_html_from_website()
+    source = parse_html_to_models(html) if html else None
+    if source:
+        save_models_to_cache(source)
+        print(f'Загружено с сайта: {len(source)} строк тарифов')
     else:
-        models_data, timestamp = load_models_from_cache()
-        if models_data:
-            print(f"Сайт недоступен, используется кэш от {timestamp}")
-            source_data = models_data
-        else:
-            print("Сайт недоступен и кэш не найден. Пожалуйста, проверьте соединение с интернетом.")
-            return
-    
-    # Загрузка бенчмарков
-    env_vars = load_env()
-    api_key = env_vars.get('ARTIFICICAL_ANALYSIS_API') or env_vars.get('ARTIFICIAL_ANALYSIS_API')
-    model_names = [row[0] for row in source_data]
-    benchmarks = get_benchmarks_for_models(model_names, api_key)
-    
-    models = []
-    for row in source_data:
-        name = row[0]
-        input_price = row[1]
-        output_price = row[2]
-        
-        input_val = parse_price(input_price)
-        output_val = parse_price(output_price)
-        
-        weighted_price = 0.9784 * input_val + 0.0216 * output_val if input_val != float('inf') and output_val != float('inf') else float('inf')
-
-        bench = benchmarks.get(name) if benchmarks else None
-
-        # Ищем BridgeBench через маппинг (по нормализованным именам)
-        bridgebench = None
-        if benchmarks:
-            norm_name = normalize_name(name)
-            for bb_name, score in BRIDGEBENCH_DATA.items():
-                norm_bb = normalize_name(bb_name)
-                # Точное совпадение
-                if norm_name == norm_bb:
-                    bridgebench = score
-                    break
-
-                # Проверяем по словам
-                bb_words = set(norm_bb.split())
-                name_words = set(norm_name.split())
-
-                # Если в BB есть "codex", то и в имени должно быть "codex"
-                bb_has_codex = 'codex' in bb_words
-                name_has_codex = 'codex' in name_words
-                if bb_has_codex != name_has_codex:
-                    continue
-
-                # Исключаем "codex" из проверки (уже проверили выше)
-                exclude_words = {'codex', 'pro', 'preview', 'plus'}
-                bb_key_words = bb_words - exclude_words
-                if bb_key_words and bb_key_words.issubset(name_words):
-                    # Проверяем версии
-                    bb_nums = set(w for w in bb_words if any(c.isdigit() for c in w))
-                    name_nums = set(w for w in name_words if any(c.isdigit() for c in w))
-                    if bb_nums == name_nums or not bb_nums:
-                        bridgebench = score
-                        break
-
-        coding = bench.get('coding') if bench else None
-        models.append({
-            'name': name,
-            'input_price': input_price,
-            'output_price': output_price,
-            'weighted_price': weighted_price,
-            'gpqa': bench.get('gpqa') if bench else None,
-            'coding': coding,
-            'cod_index': compute_cod_index(coding),
-            'bridgebench': bridgebench,
-        })
-    
-    models_sorted = sorted(
-        models,
-        key=lambda x: (
-            x['weighted_price'],
-            float('inf') if x['cod_index'] is None else -x['cod_index'],
-        ),
+        source, timestamp = load_models_from_cache()
+        if not source:
+            print('Не удалось получить цены; локальный кэш отсутствует или повреждён.')
+            return 1
+        print(f'Используется кэш цен от {timestamp or "неизвестной даты"}')
+    benchmarks = None if args.no_benchmarks else get_benchmarks_for_models(
+        [row[0] for row in source], None if args.offline else get_api_key(),
+        offline=args.offline, refresh=args.refresh_benchmarks,
     )
-    
-    has_benchmarks = benchmarks is not None
-    has_bridgebench = any(m.get('bridgebench') is not None for m in models)
-
+    models = []
+    for row in source:
+        name, input_price, output_price = row[:3]
+        bench = (benchmarks or {}).get(name) or {}
+        coding = bench.get('coding')
+        models.append({
+            'name': name, 'input_price': input_price, 'output_price': output_price,
+            'weighted_price': INPUT_WEIGHT * parse_price(input_price) + OUTPUT_WEIGHT * parse_price(output_price),
+            'coding': coding, 'cod_index': compute_cod_index(coding), 'gpqa': bench.get('gpqa'),
+            'bridgebench': find_bridgebench(name),
+        })
+    models.sort(key=lambda model: (model['weighted_price'], -(model['cod_index'] or 0)))
+    has_benchmarks = any(has_useful_benchmark(model) for model in models)
+    has_bridgebench = any(model['bridgebench'] is not None for model in models)
+    name_width = max(40, max(len(model['name']) for model in models))
+    header = f'{"Model":<{name_width}} {"Input":<10} {"Output":<10} {"Weighted":<10}'
     if has_benchmarks:
-        bb_col = 7 if has_bridgebench else 0
-        bb_header = f" {'Bridge':<{bb_col}}" if has_bridgebench else ""
-        header = f"{'Model':<40} {'Input':<10} {'Output':<10} {'Weighted':<10} {'CodIdx':<8} {'Coding':<8} {'GPQA':<8}" + bb_header
-        separator = "-" * (94 + bb_col)
-    else:
-        header = f"{'Model':<40} {'Input':<12} {'Output':<12} {'Weighted':<12}"
-        separator = "-" * 76
-
-    print()
-    print(header)
-    print(separator)
-    for model in models_sorted:
-        if model['weighted_price'] != float('inf'):
-            weighted_str = f"${model['weighted_price']:.4f}"
-        else:
-            weighted_str = "-"
-
+        header += f' {"CodIdx":<8} {"Coding":<8} {"GPQA":<8}'
+    if has_bridgebench:
+        header += f' {"Bridge":<8}'
+    print('\n' + header + '\n' + '-' * len(header))
+    for model in models:
+        price = f"${model['weighted_price']:.4f}" if math.isfinite(model['weighted_price']) else '-'
+        line = f'{model["name"]:<{name_width}} {model["input_price"]:<10} {model["output_price"]:<10} {price:<10}'
         if has_benchmarks:
-            cod_idx_str = format_cod_index(model['cod_index'])
-            coding_str = format_benchmark(model['coding'])
-            gpqa_str = format_benchmark(model['gpqa'])
-            bb_str = format_benchmark(model['bridgebench']) if has_bridgebench else ""
-            if has_bridgebench:
-                print(f"{model['name']:<40} {model['input_price']:<10} {model['output_price']:<10} {weighted_str:<10} {cod_idx_str:<8} {coding_str:<8} {gpqa_str:<8} {bb_str:<{bb_col}}")
-            else:
-                print(f"{model['name']:<40} {model['input_price']:<10} {model['output_price']:<10} {weighted_str:<10} {cod_idx_str:<8} {coding_str:<8} {gpqa_str:<8}")
-        else:
-            print(f"{model['name']:<40} {model['input_price']:<12} {model['output_price']:<12} {weighted_str:<12}")
-
-    if has_benchmarks:
-        print()
-        print(f"CodIdx: линейный индекс кодинга (10=Haiku 3.5, 100=Opus 4.6). Coding = AA Coding Index, GPQA = GPQA Diamond")
+            line += f' {format_benchmark(model["cod_index"]):<8} {format_benchmark(model["coding"]):<8} {format_benchmark(model["gpqa"], percentage=True):<8}'
         if has_bridgebench:
-            print(f"Bridge = BridgeBench Overall (источник: bridgemind.ai)")
-        print("Источник бенчмарков: artificialanalysis.ai")
+            line += f' {format_benchmark(model["bridgebench"]):<8}'
+        print(line)
+    print('\nUSD за 1 млн токенов. Weighted = 97.84% Input + 2.16% Output; кэширование не учтено.')
+    if has_benchmarks:
+        print('Coding = AA Coding Index; GPQA = GPQA Diamond. Источник: https://artificialanalysis.ai/')
+        print('CodIdx: историческая шкала 10.7 → 10, 48.1 → 100; может превышать 100.')
+        print('Для одной модели выбирается доступный вариант с наибольшим reasoning effort.')
+    if has_bridgebench:
+        print(f'Bridge = {BRIDGEBENCH["metric"]}, снимок от {BRIDGEBENCH["checked_at"]}: {BRIDGEBENCH["source"]}')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
